@@ -351,26 +351,28 @@ def startTest(stdscr: curses.window, ip_list: Pattern[AnyStr], config: configpar
                 str = f", Upload: {upload_speed}Mbps"
                 stdscr.addstr(1, col, str)
                 stdscr.refresh()
+                col = col + len(str)
 
-            if download_speed > 0:
+            if min_download_speed > 0:
                 # Calculate download speed of selected ip using related function
                 download_speed = getDownloadSpeed(ip, test_size, min_download_speed)
                 # Ignore the IP if download speed dosn't match the minimum required speed
-
-                stdscr.move(1, 0)
-                stdscr.clrtoeol()    # Clear the entire line
-                stdscr.refresh()
-
                 if download_speed < min_download_speed:
+                    stdscr.move(1, 0)
+                    stdscr.clrtoeol()    # Clear the entire line
                     continue
 
-                # Move cursor to the right position
-                stdscr.move(6, 0)
-                # Insert a new line at the cursor position, shifting the existing lines down
-                stdscr.insertln()
-                # Print out the IP and related info as well as ping, latency and download/upload speed
-                stdscr.addstr(f"|{successful_no:3d}|{ip:15s}| {ping:7d}  | {jitter:6d}  | {latency:6d}  | {upload_speed:7.2f}  | {download_speed:9.2f}  |")
+                str = f", Download: {download_speed}Mbps"
+                stdscr.addstr(1, col, str)
                 stdscr.refresh()
+
+            # Move cursor to the right position
+            stdscr.move(6, 0)
+            # Insert a new line at the cursor position, shifting the existing lines down
+            stdscr.insertln()
+            # Print out the IP and related info as well as ping, latency and download/upload speed
+            stdscr.addstr(f"|{successful_no + 1:3d}|{ip:15s}| {ping:7d}  | {jitter:6d}  | {latency:6d}  | {upload_speed:7.2f}  | {download_speed:9.2f}  |")
+            stdscr.refresh()
 
             # Increase number of successful test
             successful_no = successful_no + 1
@@ -446,15 +448,20 @@ def getPing(ip, acceptable_ping):
     # Calculate the timeout for requested minimum ping time
     timeout = acceptable_ping / 1000
     try:
-        # Start the timer for the download request
-        start_time = time.time()
-        # Get response time of the ping request
-        response_time = ping3.ping(ip, timeout=timeout)
-        # Calculate spent time for fallback
-        duration = int((time.time() - start_time) * 1000)
-        # Calculate the ping in milliseconds
-        ping = int(response_time * 1000) if response_time is not None and response_time > 0 else duration
+        # Check if ping3 module is available
+        if not print_ping_error_message:
+            # Start the timer for the download request
+            start_time = time.time()
+            # Get response time of the ping request
+            response_time = ping3.ping(ip, timeout=timeout)
+            # Calculate spent time for fallback
+            duration = int((time.time() - start_time) * 1000)
+            # Calculate the ping in milliseconds
+            ping = int(response_time * 1000) if response_time is not None and response_time > 0 else duration
+        else:
+            ping = 9999
     except Exception as e:
+        print(f"\nPing error for {ip}: {str(e)}")
         ping = -1
 
     # Return ping and jitter in milliseconds
