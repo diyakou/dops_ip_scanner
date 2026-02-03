@@ -4,44 +4,70 @@ import csv
 import ipaddress
 import json
 import random
+import re
 import ssl
 import sys
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from urllib.request import urlopen, Request
-
+from urllib.error import HTTPError, URLError
+import socket
+from contextlib import contextmanager
 FASTLY_IP_LIST_URL = "https://api.fastly.com/public-ip-list"
 
 # ===== تنظیمات اصلی =====
-TEST_HOST = "www.github.com"   # بهتر: دامنه‌ی خودت یا سرویسی که مطمئنی پشت Fastly هست
-TEST_PATH = "/"                # مسیر سبک
+TEST_HOST = "www.github.com"
+TEST_PATH = "/"
 PORT = 443
 
-SAMPLES_PER_CIDR_V4 = 200      # زیادش کن: 300 یا 500
+SAMPLES_PER_CIDR_V4 = 200
 INCLUDE_IPV6 = False
 
 CONCURRENCY = 200
 
-PING_ENABLED = False
+PING_ENABLED = True          # ✅ اگر می‌خوای واقعا ping هم لحاظ شه True کن
 PING_TIMEOUT_MS = 900
 
-TCP_TIMEOUT = 2.0              # جداگانه برای TCP
-TLS_TIMEOUT = 3.0              # جداگانه برای TLS
-READ_TIMEOUT = 4.0             # برای خواندن دیتا
-READ_BYTES = 150_000           # کمتر = شانس OK بیشتر (150KB)
+TCP_TIMEOUT = 2.0
+TLS_TIMEOUT = 3.0
+READ_TIMEOUT = 4.0
+READ_BYTES = 150_000
 
 SEED = 7
 
-# اگر True: حتی اگه verify fail شد، insecure رو هم امتحان می‌کنیم
 TRY_INSECURE_TLS = True
 # ========================
 
+# ===== Cloudflare Auto DNS =====
+CF_ENABLED = True  # ✅ فعال/غیرفعال کردن کل بخش کلادفلر
+
+# از Cloudflare > My Profile > API Tokens بساز:
+# Permissions: Zone:DNS:Edit  + Zone:Zone:Read (یا Zone:Read)
+CF_API_TOKEN = ""   # مثلا: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+CF_ZONE_ID = ""     # Zone ID دامنه‌ات (تو Overview هست)
+
+# ساب‌دامنه(هایی) که می‌خوای تنظیم بشن (قبلی‌هاشون پاک میشه)
+CF_RECORD_NAMES = [
+    "server-fastly.simple.ir",
+    # "best2.example.com",
+]
+
+CF_PROXIED = False  # اگر می‌خوای پشت پروکسی کلادفلر باشه True کن
+CF_TTL = 1          # 1 یعنی Auto
+# ===============================
+@contextmanager
+def force_ipv4_dns():
+    old_getaddrinfo = socket.getaddrinfo
+    def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        return old_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+    socket.getaddrinfo = ipv4_only
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = old_getaddrinfo
+
 
 def fetch_fastly_ranges() -> Tuple[List[str], List[str]]:
-    """
-    1) از API رسمی Fastly می‌گیرد (با retry).
-    2) اگر fail شد، از fallback CIDRهای معروف استفاده می‌کند تا تست متوقف نشود.
-    """
     fallback_ipv4 = [
         "140.248.128.0/17",
         "199.232.0.0/16",
@@ -70,7 +96,6 @@ def fetch_fastly_ranges() -> Tuple[List[str], List[str]]:
     req = Request(FASTLY_IP_LIST_URL, headers={"User-Agent": "fastly-probe/2.1"})
     last_err = None
 
-    # Retry با timeout بیشتر
     for attempt in range(1, 4):
         try:
             with urlopen(req, timeout=45) as r:
@@ -82,7 +107,6 @@ def fetch_fastly_ranges() -> Tuple[List[str], List[str]]:
             last_err = "API returned empty list"
         except Exception as e:
             last_err = str(e)
-            # مکث کوتاه بین تلاش‌ها
             try:
                 time.sleep(1.5 * attempt)
             except Exception:
@@ -90,7 +114,6 @@ def fetch_fastly_ranges() -> Tuple[List[str], List[str]]:
 
     print(f"⚠️ Fastly API fetch failed, using fallback CIDRs. Reason: {last_err}")
     return fallback_ipv4, fallback_ipv6
-
 
 
 def sample_ips_from_cidr(cidr: str, k: int, seed: int = 0) -> List[str]:
@@ -118,7 +141,11 @@ def sample_ips_from_cidr(cidr: str, k: int, seed: int = 0) -> List[str]:
     return [str(ipaddress.ip_address(x)) for x in picks]
 
 
-async def ping_ip(ip: str, timeout_ms: int = 800) -> bool:
+async def ping_latency_ms(ip: str, timeout_ms: int = 900) -> Optional[float]:
+    """
+    ping واقعی و استخراج زمان (ms).
+    اگر fail شود None برمی‌گرداند.
+    """
     is_windows = sys.platform.startswith("win")
     if is_windows:
         cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
@@ -129,16 +156,31 @@ async def ping_ip(ip: str, timeout_ms: int = 800) -> bool:
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        return (await proc.wait()) == 0
+        out, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+
+        text = out.decode("utf-8", errors="ignore")
+
+        # Windows: time=14ms
+        m = re.search(r"time[=<]\s*(\d+)\s*ms", text, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+
+        # Linux/mac: time=14.2 ms
+        m = re.search(r"time[=<]\s*([\d\.]+)\s*ms", text, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+
+        return None
     except Exception:
-        return False
+        return None
 
 
 async def tcp_connect_only(ip: str):
-    """فقط TCP connect به 443 (بدون TLS)"""
     t0 = time.time()
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, PORT), timeout=TCP_TIMEOUT)
@@ -162,16 +204,10 @@ def make_ssl_ctx(insecure: bool):
 
 
 async def https_probe_and_speed(ip: str) -> dict:
-    """
-    1) TCP connect check
-    2) TLS connect (verified) - اگر fail شد و TRY_INSECURE_TLS=True => insecure
-    3) HTTP GET و خواندن مقدار کمی دیتا + محاسبه سرعت
-    """
     ok_tcp, tcp_ms, tcp_err = await tcp_connect_only(ip)
     if not ok_tcp:
-        return {"ip": ip, "ok": False, "stage": "tcp", "connect_ms": None, "mbps": None, "http": None, "tls_mode": None, "err": tcp_err}
+        return {"ip": ip, "ok": False, "stage": "tcp", "connect_ms": None, "mbps": None, "http": None, "tls_mode": None, "ping_ms": None, "err": tcp_err}
 
-    # --- TLS verified ---
     tls_mode = "verified"
     ctx = make_ssl_ctx(insecure=False)
 
@@ -182,9 +218,8 @@ async def https_probe_and_speed(ip: str) -> dict:
         connect_ms = (time.time() - t0) * 1000
     except Exception as e_verified:
         if not TRY_INSECURE_TLS:
-            return {"ip": ip, "ok": False, "stage": "tls", "connect_ms": None, "mbps": None, "http": None, "tls_mode": "verified", "err": str(e_verified)}
+            return {"ip": ip, "ok": False, "stage": "tls", "connect_ms": None, "mbps": None, "http": None, "tls_mode": "verified", "ping_ms": None, "err": str(e_verified)}
 
-        # --- TLS insecure fallback ---
         tls_mode = "insecure"
         ctx2 = make_ssl_ctx(insecure=True)
         t0b = time.time()
@@ -192,12 +227,10 @@ async def https_probe_and_speed(ip: str) -> dict:
             coro = asyncio.open_connection(host=ip, port=PORT, ssl=ctx2, server_hostname=TEST_HOST)
             reader, writer = await asyncio.wait_for(coro, timeout=TLS_TIMEOUT)
             connect_ms = (time.time() - t0b) * 1000
-            # خطای verify رو نگه می‌داریم برای گزارش
             verify_err = str(e_verified)
         except Exception as e_insecure:
-            return {"ip": ip, "ok": False, "stage": "tls", "connect_ms": None, "mbps": None, "http": None, "tls_mode": "insecure", "err": str(e_insecure)}
+            return {"ip": ip, "ok": False, "stage": "tls", "connect_ms": None, "mbps": None, "http": None, "tls_mode": "insecure", "ping_ms": None, "err": str(e_insecure)}
 
-    # --- HTTP request ---
     try:
         req = (
             f"GET {TEST_PATH} HTTP/1.1\r\n"
@@ -209,24 +242,20 @@ async def https_probe_and_speed(ip: str) -> dict:
         writer.write(req.encode("utf-8"))
         await writer.drain()
 
-        # اول چند کیلوبایت بخونیم تا status code رو دربیاریم
         head = await asyncio.wait_for(reader.read(4096), timeout=READ_TIMEOUT)
         if not head:
             writer.close()
-            return {"ip": ip, "ok": False, "stage": "read", "connect_ms": round(connect_ms, 1), "mbps": None, "http": None, "tls_mode": tls_mode, "err": "no data"}
+            return {"ip": ip, "ok": False, "stage": "read", "connect_ms": round(connect_ms, 1), "mbps": None, "http": None, "tls_mode": tls_mode, "ping_ms": None, "err": "no data"}
 
-        # status code
         http_code = None
         try:
             first_line = head.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
-            # مثال: HTTP/1.1 200 OK
             parts = first_line.split()
             if len(parts) >= 2 and parts[1].isdigit():
                 http_code = int(parts[1])
         except Exception:
             http_code = None
 
-        # حالا بقیه دیتا برای سرعت (همون head هم جزو دیتا حساب میشه)
         got = len(head)
         t1 = time.time()
         while got < READ_BYTES:
@@ -242,11 +271,7 @@ async def https_probe_and_speed(ip: str) -> dict:
         except Exception:
             pass
 
-        # حتی اگر 403/301 باشه هم یعنی IP جواب داده (هدف تو همین بود)
-        if dt <= 0:
-            mbps = 0.0
-        else:
-            mbps = (got * 8) / (dt * 1_000_000)
+        mbps = 0.0 if dt <= 0 else (got * 8) / (dt * 1_000_000)
 
         out = {
             "ip": ip,
@@ -256,6 +281,7 @@ async def https_probe_and_speed(ip: str) -> dict:
             "mbps": round(mbps, 2),
             "http": http_code,
             "tls_mode": tls_mode,
+            "ping_ms": None,
             "err": ""
         }
         if tls_mode == "insecure":
@@ -267,7 +293,102 @@ async def https_probe_and_speed(ip: str) -> dict:
             writer.close()
         except Exception:
             pass
-        return {"ip": ip, "ok": False, "stage": "read", "connect_ms": round(connect_ms, 1), "mbps": None, "http": None, "tls_mode": tls_mode, "err": str(e)}
+        return {"ip": ip, "ok": False, "stage": "read", "connect_ms": round(connect_ms, 1), "mbps": None, "http": None, "tls_mode": tls_mode, "ping_ms": None, "err": str(e)}
+
+
+# -------- Cloudflare helpers --------
+def cf_api_request(method: str, url: str, payload: Optional[dict] = None) -> dict:
+    if not CF_API_TOKEN:
+        raise RuntimeError("CF_API_TOKEN خالیه. توکن کلادفلر رو تنظیم کن.")
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "fastly-probe-cf/1.0",
+    }
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = Request(url, headers=headers, data=data, method=method)
+
+    print(f"CF → {method} {url}")  # ✅ debug
+
+    # ✅ timeout کوتاه تا گیر نکنه
+    timeout_s = 10
+
+    # ✅ اجبار IPv4 (خیلی وقت‌ها همین مشکل رو حل می‌کنه)
+    with force_ipv4_dns():
+        try:
+            with urlopen(req, timeout=timeout_s) as r:
+                raw = r.read().decode("utf-8", errors="ignore")
+                return json.loads(raw)
+        except HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            raise RuntimeError(f"Cloudflare HTTPError {e.code}: {body}") from e
+        except URLError as e:
+            raise RuntimeError(f"Cloudflare URLError: {e}") from e
+
+def cf_delete_records_by_name(record_name: str):
+    base = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
+    qurl = f"{base}?type=A&name={record_name}"
+    res = cf_api_request("GET", qurl)
+    if not res.get("success"):
+        raise RuntimeError(f"Cloudflare list failed: {res}")
+
+    items = res.get("result", [])
+    for it in items:
+        rid = it.get("id")
+        if rid:
+            durl = f"{base}/{rid}"
+            cf_api_request("DELETE", durl)
+            print(f"🗑️ Deleted old A record: {record_name} (id={rid})")
+
+
+def cf_create_a_record(record_name: str, ip: str):
+    base = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records"
+    payload = {
+        "type": "A",
+        "name": record_name,
+        "content": ip,
+        "ttl": CF_TTL,
+        "proxied": CF_PROXIED,
+    }
+    res = cf_api_request("POST", base, payload)
+    if not res.get("success"):
+        raise RuntimeError(f"Cloudflare create failed: {res}")
+    print(f"✅ Cloudflare set: {record_name} -> {ip} (proxied={CF_PROXIED})")
+
+
+def push_best_ip_to_cloudflare(best_ip: str):
+    if not CF_ENABLED:
+        return
+    if not CF_ZONE_ID:
+        raise RuntimeError("CF_ZONE_ID خالیه. Zone ID رو تنظیم کن.")
+
+    for name in CF_RECORD_NAMES:
+        cf_delete_records_by_name(name)   # پاک کردن قبلی‌ها
+        cf_create_a_record(name, best_ip) # ساخت رکورد جدید
+
+
+def pick_best(alive: List[dict]) -> Optional[dict]:
+    if not alive:
+        return None
+
+    # اگر ping فعال باشه: اول ping کمتر، بعد سرعت بیشتر
+    # اگر ping نباشه: connect_ms کمتر (تقریب پینگ)، بعد سرعت بیشتر
+    def key(x: dict):
+        ping = x.get("ping_ms")
+        conn = x.get("connect_ms")
+        mbps = x.get("mbps") or 0.0
+        # None ها رو خیلی بد در نظر بگیر
+        ping_sort = ping if ping is not None else 10_000.0
+        conn_sort = conn if conn is not None else 10_000.0
+        if PING_ENABLED:
+            return (ping_sort, -mbps, conn_sort)
+        return (conn_sort, -mbps)
+
+    return sorted(alive, key=key)[0]
 
 
 async def main():
@@ -290,9 +411,10 @@ async def main():
 
     async def worker(ip: str):
         async with sem:
-            if PING_ENABLED:
-                _ = await ping_ip(ip, timeout_ms=PING_TIMEOUT_MS)  # فقط info ـه
-            return await https_probe_and_speed(ip)
+            r = await https_probe_and_speed(ip)
+            if r.get("ok") and PING_ENABLED:
+                r["ping_ms"] = await ping_latency_ms(ip, timeout_ms=PING_TIMEOUT_MS)
+            return r
 
     tasks = [asyncio.create_task(worker(ip)) for ip in targets]
 
@@ -305,7 +427,9 @@ async def main():
 
         if r["ok"]:
             ok_count += 1
-            print(f'✅ {r["ip"]}  {r["tls_mode"]}  {r["connect_ms"]}ms  {r["mbps"]}Mbps  http={r["http"]}')
+            pm = r.get("ping_ms")
+            pm_txt = f"{pm}ms" if pm is not None else "na"
+            print(f'✅ {r["ip"]}  {r["tls_mode"]}  ping={pm_txt}  tls={r["connect_ms"]}ms  {r["mbps"]}Mbps  http={r["http"]}')
         else:
             print(f'❌ {r["ip"]}  {r["stage"]}  {r["err"]}')
 
@@ -315,18 +439,19 @@ async def main():
     alive = [x for x in results if x["ok"]]
     dead = [x for x in results if not x["ok"]]
 
+    # مرتب‌سازی برای خروجی (صرفاً برای فایل‌ها)
     alive_sorted = sorted(alive, key=lambda x: (x["mbps"] or 0), reverse=True)
 
     with open("alive_fastly.txt", "w", encoding="utf-8") as f:
         for x in alive_sorted:
-            f.write(f'{x["ip"]}  tls={x["tls_mode"]}  {x["connect_ms"]}ms  {x["mbps"]}Mbps  http={x["http"]}\n')
+            f.write(f'{x["ip"]}  tls={x["tls_mode"]}  ping={x.get("ping_ms")}ms  connect={x["connect_ms"]}ms  {x["mbps"]}Mbps  http={x["http"]}\n')
 
     with open("dead_fastly.txt", "w", encoding="utf-8") as f:
         for x in dead:
             f.write(f'{x["ip"]}  stage={x["stage"]}  tls={x["tls_mode"]}  err={x["err"]}\n')
 
     with open("fastly_results.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["ip", "ok", "stage", "tls_mode", "connect_ms", "mbps", "http", "err"])
+        w = csv.DictWriter(f, fieldnames=["ip", "ok", "stage", "tls_mode", "connect_ms", "ping_ms", "mbps", "http", "err"])
         w.writeheader()
         w.writerows(results)
 
@@ -334,6 +459,24 @@ async def main():
     print(f"Alive: {len(alive)} -> alive_fastly.txt")
     print(f"Dead : {len(dead)} -> dead_fastly.txt")
     print("CSV  : fastly_results.csv")
+
+    # ✅ انتخاب بهترین و ست کردن روی Cloudflare
+    best = pick_best(alive)
+    if not best:
+        print("⚠️ No alive IP found. Cloudflare update skipped.")
+        return
+
+    print("\n🏆 Best IP selected:")
+    print(f'IP={best["ip"]}  ping={best.get("ping_ms")}ms  connect={best.get("connect_ms")}ms  mbps={best.get("mbps")}')
+
+    try:
+        print("➡️ entering cloudflare update...")
+        await asyncio.to_thread(push_best_ip_to_cloudflare, best["ip"])
+
+        print("✅ cloudflare update done.")
+    except Exception as e:
+        print(f"⚠️ Cloudflare update failed: {e}")
+    
 
 
 if __name__ == "__main__":
