@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
+"""
+🚀 DNS Parallel Tester - بهتری‌های فعلی:
+- Parallel testing (همزمان تست چند DNS)
+- dig استفاده (بهتر از nslookup)
+- Success rate tracking
+- Min/Max/Avg latency
+- Better scoring system
+"""
 import subprocess
 import time
 import sys
 from typing import Optional, List, Tuple, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import statistics
 
 # ================= تنظیمات =================
-TEST_DOMAIN_1 = "server-fastly.morvism.ir"  # ساب‌دامنه‌ی شما
-TEST_DOMAIN_2 = "chatgpt.com"            # تست سلامت DNS با کلادفلر (می‌تونی one.one.one.one هم بذاری)
+TEST_DOMAINS = [
+    "ar1.kingv2.com",  # ساب‌دامنه شما
+    "chatgpt.com",               # دسترسی بیرونی
+    "google.com",                # تست اضافی
+]
 
-TIMEOUT = 2.8   # ثانیه برای هر nslookup
-REPEAT = 2      # تعداد تکرار برای میانگین
+TIMEOUT = 2.8          # ثانیه برای هر dig query
+QUERIES_PER_DNS = 5    # تعداد query برای محاسبه reliability
+MAX_WORKERS = 15       # تعداد parallel workers
 # ===========================================
 
 RAW_DNS_LIST = [
@@ -35,44 +49,32 @@ RAW_DNS_LIST = [
     ("Gmaing DNS 8", "185.121.177.177"), ("Gmaing DNS 8", "169.239.202.202"),
     ("Gmaing DNS 9", "185.231.182.126"), ("Gmaing DNS 9", "185.43.135.1"),
     ("Gmaing DNS 10", "185.43.135.1"), ("Gmaing DNS 10", "46.16.216.25"),
-    ("Gmaing DNS 11", "185.213.182.126"), ("Gmaing DNS 11", "185.43.135.1"),
-    ("Gmaing DNS 12", "199.85.127.10"), ("Gmaing DNS 12", "185.231.182.126"),
-    ("Gmaing DNS 13", "91.239.100.100"), ("Gmaing DNS 13", "37.152.182.112"),
-    ("Gmaing DNS 14", "8.26.56.26"), ("Gmaing DNS 14", "8.20.247.20"),
-    ("Gmaing DNS 15", "78.157.42.100"), ("Gmaing DNS 15", "1.1.1.1"),
-    ("Gmaing DNS 16", "87.135.66.81"), ("Gmaing DNS 16", "76.76.10.4"),
-
     ("مخابرات/شاتل/آسیاتک/رایتل", "91.239.100.100"), ("مخابرات/شاتل/آسیاتک/رایتل", "89.233.43.71"),
     ("پارس آنلاین", "46.224.1.221"), ("پارس آنلاین", "46.224.1.220"),
     ("همراه اول", "208.67.220.200"), ("همراه اول", "208.67.222.222"),
-    ("ایرانسل", "109.69.8.51"), ("ایرانسل", "0.0.0.0"),
-    ("ایرانسل", "74.82.42.42"), ("ایرانسل", "0.0.0.0"),
+    ("ایرانسل", "109.69.8.51"), ("ایرانسل", "74.82.42.42"),
     ("مخابرات", "8.8.8.8"), ("مخابرات", "8.8.4.4"),
     ("مخابرات", "4.4.4.4"), ("مخابرات", "4.2.2.4"),
     ("مخابرات", "195.46.39.39"), ("مخابرات", "195.46.39.40"),
     ("مبین نت", "10.44.8.8"), ("مبین نت", "8.8.8.8"),
     ("سایر اپراتورها", "199.85.127.10"), ("سایر اپراتورها", "199.85.126.10"),
-    ("سوئیس", "176.10.118.132"), ("سوئیس", "176.10.118.133"),
-    ("کویت", "94.187.170.2"), ("کویت", "94.187.170.3"),
-    ("اسپانیا", "195.235.194.7"), ("اسپانیا", "195.235.194.8"),
-    ("تاجیکستان", "45.81.37.0"), ("تاجیکستان", "45.81.37.1"),
 ]
 
 def run(cmd: List[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    """اجرای subprocess"""
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                            text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="timeout")
 
 def has_cmd(name: str) -> bool:
-    return subprocess.call(["bash", "-lc", f"command -v {name} >/dev/null 2>&1"]) == 0
-
-def systemd_resolved_active() -> bool:
-    p = run(["bash", "-lc", "systemctl is-active systemd-resolved"], timeout=2.0)
-    return p.stdout.strip() == "active"
-
-def get_default_iface() -> str:
-    p = run(["bash", "-lc", "ip route show default | awk '{print $5}' | head -n1"])
-    return (p.stdout or "").strip() or "eth0"
+    """چک کردن وجود command"""
+    p = subprocess.run(["which", name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.returncode == 0
 
 def normalize_dns_list(raw: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """حذف تکراری‌ها و IP‌های خاطی"""
     seen = set()
     out = []
     for name, ip in raw:
@@ -86,133 +88,210 @@ def normalize_dns_list(raw: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
         out.append(key)
     return out
 
-def nslookup_latency_ms(domain: str, dns_ip: str) -> Optional[float]:
+def dig_query(domain: str, dns_ip: str) -> Optional[float]:
     """
-    با nslookup فقط با همین DNS تست می‌کند.
-    اگر resolve موفق نبود -> None
+    تست یک domain روی یک DNS server با dig
+    خروجی: latency in ms (None = fail)
     """
-    total = 0.0
-    ok = 0
-    for _ in range(REPEAT):
-        t0 = time.time()
-        try:
-            p = run(["nslookup", domain, dns_ip], timeout=TIMEOUT)
-            if p.returncode == 0:
-                total += (time.time() - t0) * 1000
-                ok += 1
-        except subprocess.TimeoutExpired:
-            pass
-    if ok == 0:
+    t0 = time.time()
+    try:
+        p = run(["dig", f"@{dns_ip}", domain, "+short", "+timeout=2"], timeout=TIMEOUT)
+        latency = (time.time() - t0) * 1000
+        
+        # اگر dig خود جواب داده (حتی اگر خالی باشد = NODATA = موفق)
+        if p.returncode == 0 and p.stdout.strip():
+            return round(latency, 1)
+        # NODATA یا NXDOMAIN - depends on what we'relooking for
+        # اگه خالی بود = NODATA که باعث میشه return None (fail)
         return None
-    return round(total / ok, 1)
-
-def score_dns(dns_ip: str) -> Optional[Tuple[float, float, float]]:
-    """
-    باید هر دو دامنه resolve شوند.
-    خروجی: (score, lat1, lat2) - هرچی score کمتر بهتر
-    """
-    lat1 = nslookup_latency_ms(TEST_DOMAIN_1, dns_ip)
-    if lat1 is None:
-        return None
-    lat2 = nslookup_latency_ms(TEST_DOMAIN_2, dns_ip)
-    if lat2 is None:
+    except Exception:
         return None
 
-    # امتیاز: میانگین دو latency (می‌تونی وزن بدی)
-    score = round((lat1 + lat2) / 2.0, 1)
-    return score, lat1, lat2
+def test_dns_reliable(dns_ip: str, domains: List[str]) -> Dict[str, any]:
+    """
+    تست یک DNS روی چند دامنه و چند بار
+    خروجی: {domain: [latencies...], success_rate, avg_latency, min, max}
+    """
+    results = {}
+    for domain in domains:
+        latencies = []
+        for _ in range(QUERIES_PER_DNS):
+            lat = dig_query(domain, dns_ip)
+            if lat is not None:
+                latencies.append(lat)
+        
+        if latencies:
+            results[domain] = {
+                "latencies": latencies,
+                "success": len(latencies),
+                "total": QUERIES_PER_DNS,
+                "rate": round((len(latencies) / QUERIES_PER_DNS) * 100, 0),
+                "avg": round(statistics.mean(latencies), 1),
+                "min": round(min(latencies), 1),
+                "max": round(max(latencies), 1),
+                "stdev": round(statistics.stdev(latencies), 1) if len(latencies) > 1 else 0,
+            }
+        else:
+            results[domain] = {
+                "latencies": [],
+                "success": 0,
+                "total": QUERIES_PER_DNS,
+                "rate": 0,
+                "avg": None,
+                "min": None,
+                "max": None,
+                "stdev": 0,
+            }
+    
+    return results
+
+def compute_dns_score(results: Dict[str, any]) -> Optional[float]:
+    """
+    محاسبه امتیاز کل یک DNS
+    - اگر حتی یک دامنه fail شد -> None (disqualified)
+    - درغیر اینصورت: میانگین latency + penalty برای کم‌تر از 100% success
+    """
+    all_avgs = []
+    worst_rate = 100
+    
+    for domain, data in results.items():
+        if data["rate"] < 100:
+            worst_rate = min(worst_rate, data["rate"])
+        
+        if data["avg"] is None:
+            return None  # disqualify if any domain fails completely
+        
+        all_avgs.append(data["avg"])
+    
+    # امتیاز پایه: میانگین latency
+    base_score = statistics.mean(all_avgs)
+    
+    # Penalty برای کم‌تر از 100% success
+    penalty = (100 - worst_rate) * 0.5  # هر 1% کم = 0.5ms penalty
+    
+    final_score = base_score + penalty
+    return round(final_score, 1)
 
 def apply_dns_ubuntu(dns_ip: str):
-    """
-    ست کردن پایدار DNS روی اوبونتو:
-    - اگر systemd-resolved فعال بود: resolvectl
-    - اگر NetworkManager بود: nmcli
-    - fallback: /etc/resolv.conf
-    """
-    if has_cmd("resolvectl") and systemd_resolved_active():
-        iface = get_default_iface()
-        # DNS روی اینترفیس پیش‌فرض
-        p1 = run(["bash", "-lc", f"resolvectl dns {iface} {dns_ip}"])
-        if p1.returncode != 0:
-            raise RuntimeError(p1.stderr.strip() or "resolvectl dns failed")
-
-        # دامنه‌ها رو route کن روی همین لینک (اختیاری ولی مفید)
-        run(["bash", "-lc", f"resolvectl domain {iface} '~.'"])
-        run(["bash", "-lc", "resolvectl flush-caches"])
-        print(f"✅ Applied via systemd-resolved on {iface}: DNS={dns_ip}")
-        return
-
-    if has_cmd("nmcli"):
-        # کانکشن فعال
-        p = run(["bash", "-lc", "nmcli -t -f NAME,DEVICE c show --active | head -n1"])
-        line = (p.stdout or "").strip()
-        if not line:
-            raise RuntimeError("No active NetworkManager connection found.")
-        conn = line.split(":")[0]
-
-        p2 = run(["bash", "-lc", f"nmcli c modify '{conn}' ipv4.dns '{dns_ip}' ipv4.ignore-auto-dns yes"])
-        if p2.returncode != 0:
-            raise RuntimeError(p2.stderr.strip() or "nmcli modify failed")
-
-        run(["bash", "-lc", f"nmcli c down '{conn}' && nmcli c up '{conn}'"])
-        print(f"✅ Applied via NetworkManager: {conn} DNS={dns_ip}")
-        return
-
-    # fallback
-    p3 = run(["bash", "-lc", f"printf 'nameserver {dns_ip}\n' > /etc/resolv.conf"])
-    if p3.returncode != 0:
-        raise RuntimeError(p3.stderr.strip() or "write /etc/resolv.conf failed")
-    print(f"✅ Applied by writing /etc/resolv.conf (may be overwritten): DNS={dns_ip}")
+    """ست کردن DNS روی اوبونتو"""
+    try:
+        if has_cmd("resolvectl"):
+            # systemd-resolved
+            p = run(["bash", "-lc", f"sudo resolvectl dns $(ip route show default | awk '{{print $5}}' | head -n1) {dns_ip}"])
+            if p.returncode == 0:
+                run(["bash", "-lc", "sudo resolvectl flush-caches"])
+                print(f"✅ Applied via systemd-resolved: DNS={dns_ip}")
+                return
+        
+        if has_cmd("nmcli"):
+            # NetworkManager
+            p = run(["bash", "-lc", "sudo nmcli c modify $(nmcli -t -f NAME,DEVICE c show --active | head -n1 | cut -d: -f1) ipv4.dns '{dns_ip}' ipv4.ignore-auto-dns yes && nmcli c up $(nmcli -t -f NAME c show --active | head -n1)"])
+            if p.returncode == 0:
+                print(f"✅ Applied via NetworkManager: DNS={dns_ip}")
+                return
+        
+        # Fallback
+        run(["bash", "-lc", f"echo 'nameserver {dns_ip}' | sudo tee /etc/resolv.conf"])
+        print(f"✅ Applied via /etc/resolv.conf (may be overwritten): DNS={dns_ip}")
+    except Exception as e:
+        print(f"⚠️ Failed to apply DNS: {e}")
 
 def main():
-    if getattr(os := __import__("os"), "geteuid", lambda: 1)() != 0:
-        print("❗ لطفاً با sudo اجرا کن: sudo python3 dns_scan_apply.py")
+    import os
+    if os.geteuid() != 0:
+        print("❗ لطفاً با sudo اجرا کن: sudo python3 dns_tester_new.py")
         sys.exit(1)
-
-    if not has_cmd("nslookup"):
-        print("❗ nslookup پیدا نشد. نصب کن: sudo apt install -y dnsutils")
+    
+    if not has_cmd("dig"):
+        print("❗ dig پیدا نشد. نصب کن: sudo apt install -y dnsutils")
         sys.exit(1)
-
+    
     dns_list = normalize_dns_list(RAW_DNS_LIST)
-
-    print(f"🌐 DNS Scan (must resolve BOTH):")
-    print(f"  1) {TEST_DOMAIN_1}")
-    print(f"  2) {TEST_DOMAIN_2}\n")
-
-    results: List[Tuple[float, str, str, float, float]] = []
-    for name, ip in dns_list:
-        s = score_dns(ip)
-        if s is None:
-            print(f"❌ {name:<28} {ip:<15} FAIL (one of domains didn't resolve)")
-            continue
-        score, lat1, lat2 = s
-        print(f"✅ {name:<28} {ip:<15} score={score}ms  {TEST_DOMAIN_1}={lat1}ms  {TEST_DOMAIN_2}={lat2}ms")
-        results.append((score, name, ip, lat1, lat2))
-
-    if not results:
-        print("\n⚠️ هیچ DNSی پیدا نشد که هر دو دامنه رو درست Resolve کنه.")
+    
+    print(f"🌐 Parallel DNS Test ({MAX_WORKERS} workers)")
+    print(f"📋 Domains: {', '.join(TEST_DOMAINS)}")
+    print(f"🔄 Queries: {QUERIES_PER_DNS} per DNS\n")
+    
+    results_all: List[Tuple[float, str, str, Dict]] = []
+    
+    # Parallel testing با ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(test_dns_reliable, ip, TEST_DOMAINS): (name, ip)
+            for name, ip in dns_list
+        }
+        
+        done_count = 0
+        for future in as_completed(futures):
+            done_count += 1
+            name, ip = futures[future]
+            
+            try:
+                test_results = future.result()
+                score = compute_dns_score(test_results)
+                
+                if score is not None:
+                    results_all.append((score, name, ip, test_results))
+                    
+                    # نمایش خاص
+                    details = " | ".join([
+                        f"{d}={test_results[d]['avg']}ms({test_results[d]['rate']:.0f}%)"
+                        for d in TEST_DOMAINS
+                    ])
+                    print(f"✅ {name:<30} {ip:<15} score={score}ms  {details}")
+                else:
+                    print(f"❌ {name:<30} {ip:<15} FAIL (one of domains didn't resolve)")
+            
+            except Exception as e:
+                name_info = futures[future]
+                print(f"❌ Error testing {name_info}: {e}")
+            
+            if done_count % 10 == 0:
+                print(f"   Progress: {done_count}/{len(dns_list)}")
+    
+    if not results_all:
+        print("\n⚠️ هیچ DNSی پیدا نشد.")
         sys.exit(2)
-
-    best = sorted(results, key=lambda x: x[0])[0]
-    score, name, ip, lat1, lat2 = best
-
-    print("\n🏆 Best DNS Selected")
-    print(f"{name} → {ip}")
-    print(f"score={score}ms | {TEST_DOMAIN_1}={lat1}ms | {TEST_DOMAIN_2}={lat2}ms\n")
-
-    apply_dns_ubuntu(ip)
-
-    # ✅ Verify after apply (optional but useful)
-    print("\n🔎 Verify with system DNS (after apply):")
-    v1 = nslookup_latency_ms(TEST_DOMAIN_1, ip)
-    v2 = nslookup_latency_ms(TEST_DOMAIN_2, ip)
-    print(f"  {TEST_DOMAIN_1}: {'OK ' + str(v1)+'ms' if v1 is not None else 'FAIL'}")
-    print(f"  {TEST_DOMAIN_2}: {'OK ' + str(v2)+'ms' if v2 is not None else 'FAIL'}")
-
-    if has_cmd("resolvectl"):
-        print("\n(resolvectl status excerpt)")
-        p = run(["bash", "-lc", "resolvectl status | sed -n '1,120p'"])
-        print((p.stdout or "").strip())
+    
+    # مرتب‌سازی و انتخاب برتر
+    results_all.sort(key=lambda x: x[0])
+    
+    print("\n" + "="*80)
+    print("🏆 TOP 3 BEST DNS:")
+    print("="*80)
+    
+    for idx, (score, name, ip, test_results) in enumerate(results_all[:3], 1):
+        print(f"\n#{idx}. {name} → {ip}")
+        print(f"   Score: {score}ms")
+        for domain in TEST_DOMAINS:
+            data = test_results[domain]
+            if data["avg"] is not None:
+                print(f"   • {domain:<30} avg={data['avg']}ms  min={data['min']}ms  max={data['max']}ms  rate={data['rate']:.0f}%  stdev={data['stdev']}ms")
+            else:
+                print(f"   • {domain:<30} FAILED")
+    
+    # انتخاب برترین
+    best_score, best_name, best_ip, best_results = results_all[0]
+    
+    print("\n" + "="*80)
+    print(f"✅ SELECTED: {best_name} → {best_ip} (score={best_score}ms)")
+    print("="*80)
+    
+    # ست کردن
+    try:
+        apply_dns_ubuntu(best_ip)
+    except Exception as e:
+        print(f"⚠️ Failed to apply: {e}")
+    
+    # Verify
+    print("\n🔎 Final Verification (5 queries):")
+    verify_results = test_dns_reliable(best_ip, TEST_DOMAINS)
+    for domain in TEST_DOMAINS:
+        data = verify_results[domain]
+        if data["avg"] is not None:
+            print(f"   ✅ {domain}: {data['avg']}ms (success={data['rate']:.0f}%)")
+        else:
+            print(f"   ❌ {domain}: FAILED")
 
 if __name__ == "__main__":
     main()
