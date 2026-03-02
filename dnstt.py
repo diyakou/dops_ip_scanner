@@ -1,11 +1,5 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-اسکنر DNS ایران برای dnstt - دامنه NS: dnt.moonlightx.ir
-- لیست CIDR از: https://github.com/MortezaBashsiz/dnsScanner
-- فقط resolverهای سالم و سریع داخل ایران
-- مناسب Termux (کم مصرف)
-"""
+#!/usr/bin/env python3 # -*- coding: utf-8 -*- 
+""" اسکنر DNS ایران برای dnstt - دامنه NS: dnt.moonlightx.ir - لیست CIDR از: https://github.com/MortezaBashsiz/dnsScanner - فقط resolverهای سالم و سریع داخل ایران - مناسب Termux (کم مصرف) """
 
 import subprocess
 import time
@@ -20,22 +14,17 @@ import shutil
 
 # ================= تنظیمات =================
 DNSTT_NS_DOMAIN = "dnt.moonlightx.ir"   # دامنه NS که می‌خوای تست کنی
-
 TEST_DOMAINS = [
     DNSTT_NS_DOMAIN,           # مهم‌ترین: باید resolve بشه
     "whoami.cloudflare.com",   # چک resolver واقعی
     "www.google.com",          # دسترسی خارجی
 ]
-
 QUERIES_PER_DNS = 10           # تعداد query (برای dnstt مهم است پایدار باشه)
 TIMEOUT = 3.5                  # ثانیه
 MAX_WORKERS = 25               # مناسب Termux - بیشتر ممکنه هنگ کنه
-
 MIN_SUCCESS_RATE = 85.0        # حداقل درصد موفقیت (dnstt حساس است)
 MAX_AVG_LATENCY = 280.0        # ms - بالاتر معمولاً برای تونل بد است
-
-CIDR_SOURCE_URL = "https://raw.githubusercontent.com/MortezaBashsiz/dnsScanner/refs/heads/main/python/iran-ipv4.cidrs"
-
+CIDR_FILE_PATH = "iran-ipv4.cidrs"  # مسیر فایل CIDR محلی
 MAX_CIDR_TO_SAMPLE = 300       # حداکثر رنج‌هایی که نمونه‌برداری کنیم
 IPS_PER_CIDR = 5               # چند IP تصادفی از هر رنج
 
@@ -46,8 +35,7 @@ def has_dig() -> bool:
 
 def run(cmd: List[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              text=True, timeout=timeout, check=False)
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
     except:
         return subprocess.CompletedProcess(cmd, 1, "", "error")
 
@@ -100,9 +88,8 @@ def test_dns(dns_ip: str) -> Dict:
         "results": results
     }
 
-CIDR_FILE_PATH = "iran-ipv4.cidrs"  # مسیر فایل CIDR محلی
-
 def load_cidrs() -> List[str]:
+    print("در حال بارگذاری لیست CIDR...")
     try:
         with open(CIDR_FILE_PATH, 'r', encoding='utf-8') as f:
             lines = f.readlines()
@@ -114,6 +101,7 @@ def load_cidrs() -> List[str]:
         return []
 
 def sample_ips(cidrs: List[str]) -> List[str]:
+    print("در حال تولید IPها برای تست...")
     ips = []
     for cidr_str in cidrs:
         try:
@@ -122,7 +110,8 @@ def sample_ips(cidrs: List[str]) -> List[str]:
             if hosts:
                 sampled = random.sample(hosts, min(IPS_PER_CIDR, len(hosts)))
                 ips.extend(str(ip) for ip in sampled)
-        except:
+        except Exception as e:
+            print(f"خطا در پردازش CIDR {cidr_str}: {e}")
             pass
     random.shuffle(ips)
     print(f"→ {len(ips)} IP برای تست تولید شد")
@@ -145,9 +134,13 @@ def main():
         sys.exit(1)
 
     test_ips = sample_ips(cidrs)
+    if not test_ips:
+        print("هیچ IP برای تست یافت نشد.")
+        return
 
     healthy: List[Dict] = []
-
+    
+    print(f"شروع اسکن {len(test_ips)} IP...")
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(test_dns, ip) for ip in test_ips]
 
@@ -165,7 +158,7 @@ def main():
                 healthy.append(res)
                 mark = "★★" if avg < 120 else "★" if avg < 200 else ""
                 print(f"  {mark} {ip:15}   score={score:5.1f}   avg={avg:.1f}ms   min-rate={res['min_rate']:.1f}%")
-
+            
             if done % 20 == 0:
                 print(f"   پیشرفت: {done}/{total}   سالم پیدا شده: {len(healthy)}")
 
