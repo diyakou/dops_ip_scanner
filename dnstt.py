@@ -100,16 +100,17 @@ def test_dns(dns_ip: str) -> Dict:
         "results": results
     }
 
+CIDR_FILE_PATH = "iran-ipv4.cidrs"  # مسیر فایل CIDR محلی
+
 def load_cidrs() -> List[str]:
     try:
-        r = requests.get(CIDR_SOURCE_URL, timeout=15)
-        r.raise_for_status()
-        lines = r.text.strip().splitlines()
+        with open(CIDR_FILE_PATH, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
         cidrs = [line.strip() for line in lines if line.strip() and not line.startswith('#')]
         print(f"✓ لود شد {len(cidrs)} رنج CIDR ایران")
         return random.sample(cidrs, min(MAX_CIDR_TO_SAMPLE, len(cidrs)))
     except Exception as e:
-        print(f"خطا در لود لیست CIDR: {e}")
+        print(f"خطا در لود لیست CIDR از فایل: {e}")
         return []
 
 def sample_ips(cidrs: List[str]) -> List[str]:
