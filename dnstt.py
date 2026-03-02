@@ -18,8 +18,8 @@ import statistics
 
 # ================= تنظیمات =================
 TEST_DOMAINS = [
-    "whoami.cloudflare.com",     # خوب برای چک resolver واقعی
-    "www.google.com",
+    "dnt.moonlightx.",     # خوب برای چک resolver واقعی
+    "www.google.com",ir
     "dns.google",                # تست بیشتر
 ]
 
