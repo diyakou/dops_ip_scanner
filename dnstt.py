@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-اسکنر DNS ایران برای dnstt - استفاده از لیست CIDR ایران
-- لود لیست CIDR از URL یا فایل
-- انتخاب تصادفی IP از هر CIDR (برای جلوگیری از اسکن خیلی زیاد)
+اسکنر DNS ایران برای dnstt - دامنه NS: dnt.moonlightx.ir
+- لیست CIDR از: https://github.com/MortezaBashsiz/dnsScanner
+- فقط resolverهای سالم و سریع داخل ایران
+- مناسب Termux (کم مصرف)
 """
 
 import subprocess
@@ -15,29 +16,33 @@ from typing import Optional, List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 import statistics
+import shutil
 
 # ================= تنظیمات =================
+DNSTT_NS_DOMAIN = "dnt.moonlightx.ir"   # دامنه NS که می‌خوای تست کنی
+
 TEST_DOMAINS = [
-    "dnt.moonlightx.",     # خوب برای چک resolver واقعی
-    "www.google.com",ir
-    "dns.google",                # تست بیشتر
+    DNSTT_NS_DOMAIN,           # مهم‌ترین: باید resolve بشه
+    "whoami.cloudflare.com",   # چک resolver واقعی
+    "www.google.com",          # دسترسی خارجی
 ]
 
-QUERIES_PER_DNS = 15             # کمتر از قبل برای سرعت بیشتر (dnstt نیاز به پایداری دارد)
-TIMEOUT = 3.0
-MAX_WORKERS = 50
+QUERIES_PER_DNS = 10           # تعداد query (برای dnstt مهم است پایدار باشه)
+TIMEOUT = 3.5                  # ثانیه
+MAX_WORKERS = 25               # مناسب Termux - بیشتر ممکنه هنگ کنه
 
-MIN_SUCCESS_RATE = 90.0          # سخت‌گیرانه برای dnstt
-MAX_AVG_LATENCY = 300.0          # ms
+MIN_SUCCESS_RATE = 85.0        # حداقل درصد موفقیت (dnstt حساس است)
+MAX_AVG_LATENCY = 280.0        # ms - بالاتر معمولاً برای تونل بد است
 
-# منبع لیست CIDR ایران (بهترین گزینه aggregated)
 CIDR_SOURCE_URL = "https://raw.githubusercontent.com/MortezaBashsiz/dnsScanner/refs/heads/main/python/iran-ipv4.cidrs"
-# اگر آفلاین هستید → فایل محلی بگذارید مثلاً: CIDR_FILE = "iran-ipv4.cidrs"
 
-MAX_CIDR_TO_SAMPLE = 300         # حداکثر تعداد CIDR که از لیست استفاده کنیم
-IPS_PER_CIDR = 6                 # چند IP تصادفی از هر CIDR تست شود
+MAX_CIDR_TO_SAMPLE = 300       # حداکثر رنج‌هایی که نمونه‌برداری کنیم
+IPS_PER_CIDR = 5               # چند IP تصادفی از هر رنج
 
 # ===========================================
+
+def has_dig() -> bool:
+    return shutil.which("dig") is not None
 
 def run(cmd: List[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
     try:
@@ -45,11 +50,6 @@ def run(cmd: List[str], timeout: Optional[float] = None) -> subprocess.Completed
                               text=True, timeout=timeout, check=False)
     except:
         return subprocess.CompletedProcess(cmd, 1, "", "error")
-
-
-def has_dig() -> bool:
-    return subprocess.run(["which", "dig"], stdout=subprocess.DEVNULL).returncode == 0
-
 
 def dig_query(domain: str, dns_ip: str) -> Optional[float]:
     t0 = time.time()
@@ -62,123 +62,137 @@ def dig_query(domain: str, dns_ip: str) -> Optional[float]:
     except:
         return None
 
-
-def test_dns(dns_ip: str, domains: List[str]) -> Dict:
+def test_dns(dns_ip: str) -> Dict:
     results = {}
-    for domain in domains:
-        latencies = []
-        success = 0
+    success_count = 0
+    latencies = []
+
+    for domain in TEST_DOMAINS:
+        dom_success = 0
+        dom_lats = []
         for _ in range(QUERIES_PER_DNS):
             lat = dig_query(domain, dns_ip)
             if lat is not None:
+                dom_lats.append(lat)
                 latencies.append(lat)
-                success += 1
-            time.sleep(random.uniform(0.04, 0.12))  # jitter برای شبیه‌سازی واقعی
+                dom_success += 1
+            time.sleep(random.uniform(0.05, 0.15))
 
-        rate = (success / QUERIES_PER_DNS) * 100
-        stat = {
-            "rate": round(rate, 1),
-            "avg": round(statistics.mean(latencies), 1) if latencies else None,
-            "min": min(latencies) if latencies else None,
-            "max": max(latencies) if latencies else None,
-        }
-        results[domain] = stat
+        rate = (dom_success / QUERIES_PER_DNS) * 100
+        results[domain] = {"rate": round(rate, 1), "avg": round(statistics.mean(dom_lats), 1) if dom_lats else None}
 
-    min_rate = min(d["rate"] for d in results.values())
-    if min_rate >= MIN_SUCCESS_RATE and results:
-        avg_lat = statistics.mean(d["avg"] for d in results.values() if d["avg"] is not None)
-        score = round(avg_lat + (100 - min_rate) * 1.5, 1)
+        if rate >= MIN_SUCCESS_RATE:
+            success_count += 1
+
+    overall_rate = (success_count / len(TEST_DOMAINS)) * 100
+    if latencies and overall_rate >= MIN_SUCCESS_RATE:
+        avg_lat = statistics.mean(latencies)
+        penalty = (100 - min(d["rate"] for d in results.values())) * 1.2
+        score = round(avg_lat + penalty, 1)
     else:
         score = 9999.0
 
-    return {"ip": dns_ip, "results": results, "score": score, "min_rate": min_rate}
+    return {
+        "ip": dns_ip,
+        "score": score,
+        "avg_latency": round(statistics.mean(latencies), 1) if latencies else None,
+        "min_rate": min(d["rate"] for d in results.values()),
+        "results": results
+    }
 
-
-def load_cidrs_from_url(url: str) -> List[str]:
+def load_cidrs() -> List[str]:
     try:
-        r = requests.get(url, timeout=12)
+        r = requests.get(CIDR_SOURCE_URL, timeout=15)
         r.raise_for_status()
         lines = r.text.strip().splitlines()
         cidrs = [line.strip() for line in lines if line.strip() and not line.startswith('#')]
-        print(f"✓ لود شد: {len(cidrs)} رنج CIDR از {url}")
-        return cidrs[:MAX_CIDR_TO_SAMPLE]  # محدود کردن برای سرعت
+        print(f"✓ لود شد {len(cidrs)} رنج CIDR ایران")
+        return random.sample(cidrs, min(MAX_CIDR_TO_SAMPLE, len(cidrs)))
     except Exception as e:
-        print(f"خطا در لود URL: {e}")
+        print(f"خطا در لود لیست CIDR: {e}")
         return []
 
-
-def sample_ips_from_cidrs(cidrs: List[str]) -> List[str]:
-    all_ips = []
+def sample_ips(cidrs: List[str]) -> List[str]:
+    ips = []
     for cidr_str in cidrs:
         try:
             net = ipaddress.ip_network(cidr_str, strict=False)
             hosts = list(net.hosts())
-            if not hosts:
-                continue
-            sampled = random.sample(hosts, min(IPS_PER_CIDR, len(hosts)))
-            all_ips.extend(str(ip) for ip in sampled)
+            if hosts:
+                sampled = random.sample(hosts, min(IPS_PER_CIDR, len(hosts)))
+                ips.extend(str(ip) for ip in sampled)
         except:
             pass
-    random.shuffle(all_ips)
-    print(f"→ تولید {len(all_ips)} IP نمونه برای تست")
-    return all_ips
-
+    random.shuffle(ips)
+    print(f"→ {len(ips)} IP برای تست تولید شد")
+    return ips
 
 def main():
     if not has_dig():
-        print("dig نصب نیست → sudo apt install dnsutils")
+        print("❗ dig پیدا نشد")
+        print("   در Termux بزن:")
+        print("      pkg update && pkg install dnsutils")
         sys.exit(1)
 
-    print("اسکنر DNS ایران برای dnstt")
-    print(f"   منبع CIDR: {CIDR_SOURCE_URL}")
-    print(f"   تست‌ها: {QUERIES_PER_DNS} query   حداقل success: {MIN_SUCCESS_RATE}%   max avg: {MAX_AVG_LATENCY}ms\n")
+    print(f"اسکن DNSهای ایران برای dnstt → NS: {DNSTT_NS_DOMAIN}")
+    print(f"   تست روی: {', '.join(TEST_DOMAINS)}")
+    print(f"   حداقل success: {MIN_SUCCESS_RATE}%   max avg latency: {MAX_AVG_LATENCY}ms\n")
 
-    cidrs = load_cidrs_from_url(CIDR_SOURCE_URL)
+    cidrs = load_cidrs()
     if not cidrs:
-        print("هیچ CIDRی لود نشد. اسکریپت متوقف می‌شود.")
+        print("لیست CIDR لود نشد. برنامه متوقف می‌شود.")
         sys.exit(1)
 
-    test_ips = sample_ips_from_cidrs(cidrs)
+    test_ips = sample_ips(cidrs)
 
-    healthy = []
+    healthy: List[Dict] = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(test_dns, ip, TEST_DOMAINS) for ip in test_ips]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(test_dns, ip) for ip in test_ips]
 
         done = 0
-        for fut in as_completed(futures):
+        total = len(test_ips)
+
+        for future in as_completed(futures):
             done += 1
-            res = fut.result()
+            res = future.result()
             ip = res["ip"]
             score = res["score"]
-            avg = statistics.mean(d["avg"] for d in res["results"].values() if d["avg"] is not None) if res["results"] else 999
+            avg = res["avg_latency"]
 
-            if score < 9000 and avg <= MAX_AVG_LATENCY and res["min_rate"] >= MIN_SUCCESS_RATE:
+            if score < 800 and avg is not None and avg <= MAX_AVG_LATENCY and res["min_rate"] >= MIN_SUCCESS_RATE:
                 healthy.append(res)
-                print(f"  ✓ {ip:15}   score={score:5.1f}   avg={avg:.1f}ms   rate≥{res['min_rate']:.1f}%")
-            elif done % 20 == 0:
-                print(f"  - {ip:15}   rate={res['min_rate']:.1f}%   avg={avg:.1f}ms")
+                mark = "★★" if avg < 120 else "★" if avg < 200 else ""
+                print(f"  {mark} {ip:15}   score={score:5.1f}   avg={avg:.1f}ms   min-rate={res['min_rate']:.1f}%")
 
-            if done % 40 == 0:
-                print(f"پیشرفت: {done}/{len(test_ips)}")
+            if done % 20 == 0:
+                print(f"   پیشرفت: {done}/{total}   سالم پیدا شده: {len(healthy)}")
 
-    print("\n" + "═"*70)
+    print("\n" + "═" * 60)
+
     if not healthy:
-        print("هیچ resolver خوبی پیدا نشد. معیارها را شل‌تر کنید یا لیست CIDR را چک کنید.")
+        print("هیچ DNS مناسبی پیدا نشد.")
+        print("پیشنهاد: MIN_SUCCESS_RATE را به 80 یا کمتر کاهش بده و دوباره اجرا کن.")
         return
 
     healthy.sort(key=lambda x: x["score"])
 
-    print(f"🏆 بهترین‌ها برای dnstt (top {min(10, len(healthy))})")
-    for i, dns in enumerate(healthy[:10], 1):
-        avg = statistics.mean(d["avg"] for d in dns["results"].values() if d["avg"] is not None)
-        mr = min(d["rate"] for d in dns["results"].values())
-        print(f"{i:2}. {dns['ip']:15}   score={dns['score']:5.1f}ms   avg≈{avg:.1f}ms   success≥{mr:.1f}%")
+    print(f"🏆 بهترین DNS resolverها برای اتصال به dnstt ({DNSTT_NS_DOMAIN})")
+    print("   (به ترتیب امتیاز - پایین‌تر بهتر)")
 
-    print("\nنکته: ۲–۴ تای اول را در dnstt-client تست کنید (معمولاً udp/53):")
-    print(f"   dnstt-client -udp {healthy[0]['ip']}:53   ...")
-    print("اگر زود rate-limit خورد → IP بعدی را امتحان کنید.")
+    for i, dns in enumerate(healthy[:8], 1):
+        print(f"\n{i}. {dns['ip']:15}   score = {dns['score']:5.1f}ms")
+        print(f"     avg latency ≈ {dns['avg_latency']:.1f}ms   success ≥ {dns['min_rate']:.1f}%")
+        for dom, data in dns["results"].items():
+            print(f"       • {dom:25} {data['avg'] if data['avg'] else 'FAIL':>6}ms ({data['rate']}%)")
 
+    print("\nدستور پیشنهادی dnstt-client (udp ساده):")
+    if healthy:
+        best_ip = healthy[0]["ip"]
+        print(f"   dnstt-client -udp {best_ip}:53 -pubkey-file server.pub {DNSTT_NS_DOMAIN} 127.0.0.1:7000")
+        print("   (server.pub را از صاحب سرور بگیر)")
+
+    print("\nاگر rate-limit شدید دیدی → IP بعدی را امتحان کن یا تعداد query را کم کن.")
 
 if __name__ == "__main__":
     main()
