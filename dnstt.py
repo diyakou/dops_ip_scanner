@@ -25,15 +25,15 @@ import dns.rcode
 import dns.exception
 
 # ================= تنظیمات =================
-DNSTT_NS_DOMAIN = "dnt.moonlightx.ir"
+DNSTT_NS_DOMAIN = "ns.a.moonlightx.ir"
 
 CIDR_FILE_PATH = "iran-ipv4.cidrs"
-MAX_CIDR_TO_SAMPLE = 300
-IPS_PER_CIDR = 5
+MAX_CIDR_TO_SAMPLE = 600
+IPS_PER_CIDR = 10
 
 MAX_WORKERS = 25
 
-TIMEOUT = 2.2  # ثانیه (برای UDP)
+TIMEOUT = 1000  # ثانیه (برای UDP)
 SLEEP_BETWEEN_QUERIES = (0.03, 0.10)
 
 MIN_SUCCESS_RATE = 85.0
